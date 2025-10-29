@@ -15,7 +15,7 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ✅ POPRAWIONE: Automatyczne wykrywanie środowiska - działa lokalnie i na Azure
+# Automatyczne wykrywanie środowiska - działa lokalnie i na Azure
 def get_base_dir():
     # Sprawdzamy czy jesteśmy na Azure (istnieje katalog /home/site)
     if os.path.exists('/home/site'):
@@ -67,7 +67,7 @@ class LogEntry(Base):
 # SPRAWDŹ CZY TABELE ISTNIEJĄ I TYLKO UTWÓRZ BRAKUJĄCE
 def setup_database():
     try:
-        # ✅ POPRAWIONE: Tworzymy tylko katalog uploads, nie całej ścieżki BASE_DIR
+        # Tworzymy tylko katalog uploads, nie całej ścieżki BASE_DIR
         uploads_dir = os.path.join(BASE_DIR, 'uploads')
         os.makedirs(uploads_dir, exist_ok=True)
         logger.info(f"Created uploads directory: {uploads_dir}")
@@ -128,7 +128,7 @@ def log_action(db, username: str, action: str, filename: Optional[str] = None, d
     db.commit()
 
 def save_file_locally(filename: str, content: bytes, username: str) -> str:
-    # ✅ POPRAWIONE: Używamy os.path.join dla cross-platform compatibility
+    # Używamy os.path.join dla cross-platform compatibility
     user_folder = os.path.join(BASE_DIR, 'uploads', username)
     os.makedirs(user_folder, exist_ok=True)
     file_path = os.path.join(user_folder, filename)
