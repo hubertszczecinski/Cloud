@@ -1,2 +1,9 @@
 .env
 venv
+__pycache__/
+*.pyc
+instance/
+.DS_Store
+.idea/
+.vscode/
+*.sqlite3
