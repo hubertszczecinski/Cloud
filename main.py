@@ -15,8 +15,21 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Database
-DATABASE_URL = "sqlite:///./file_exchange.db"
+# ✅ POPRAWIONE: Automatyczne wykrywanie środowiska - działa lokalnie i na Azure
+def get_base_dir():
+    # Sprawdzamy czy jesteśmy na Azure (istnieje katalog /home/site)
+    if os.path.exists('/home/site'):
+        return '/home/site/wwwroot'
+    else:
+        # Lokalnie używamy bieżącego katalogu
+        return os.getcwd()
+
+BASE_DIR = get_base_dir()
+DATABASE_URL = f"sqlite:///{os.path.join(BASE_DIR, 'file_exchange.db')}"
+
+logger.info(f"Using BASE_DIR: {BASE_DIR}")
+logger.info(f"Using DATABASE_URL: {DATABASE_URL}")
+
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -53,18 +66,28 @@ class LogEntry(Base):
 
 # SPRAWDŹ CZY TABELE ISTNIEJĄ I TYLKO UTWÓRZ BRAKUJĄCE
 def setup_database():
-    inspector = inspect(engine)
-    existing_tables = inspector.get_table_names()
-    
-    required_tables = ['users', 'files', 'logs']
-    missing_tables = [table for table in required_tables if table not in existing_tables]
-    
-    if missing_tables:
-        logger.info(f"Creating missing tables: {missing_tables}")
-        Base.metadata.create_all(bind=engine)
-        logger.info("Database tables created successfully")
-    else:
-        logger.info("All database tables already exist")
+    try:
+        # ✅ POPRAWIONE: Tworzymy tylko katalog uploads, nie całej ścieżki BASE_DIR
+        uploads_dir = os.path.join(BASE_DIR, 'uploads')
+        os.makedirs(uploads_dir, exist_ok=True)
+        logger.info(f"Created uploads directory: {uploads_dir}")
+        
+        inspector = inspect(engine)
+        existing_tables = inspector.get_table_names()
+        
+        required_tables = ['users', 'files', 'logs']
+        missing_tables = [table for table in required_tables if table not in existing_tables]
+        
+        if missing_tables:
+            logger.info(f"Creating missing tables: {missing_tables}")
+            Base.metadata.create_all(bind=engine)
+            logger.info("Database tables created successfully")
+        else:
+            logger.info("All database tables already exist")
+            
+    except Exception as e:
+        logger.error(f"Database setup error: {str(e)}")
+        raise
 
 # Wywołaj setup przy starcie
 setup_database()
@@ -105,9 +128,10 @@ def log_action(db, username: str, action: str, filename: Optional[str] = None, d
     db.commit()
 
 def save_file_locally(filename: str, content: bytes, username: str) -> str:
-    user_folder = f"uploads/{username}"
+    # ✅ POPRAWIONE: Używamy os.path.join dla cross-platform compatibility
+    user_folder = os.path.join(BASE_DIR, 'uploads', username)
     os.makedirs(user_folder, exist_ok=True)
-    file_path = f"{user_folder}/{filename}"
+    file_path = os.path.join(user_folder, filename)
     with open(file_path, "wb") as f:
         f.write(content)
     return file_path
@@ -377,24 +401,6 @@ async def get_logs(api_key: str, db = Depends(get_db)):
     except Exception as e:
         logger.error(f"Get logs error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to get logs: {str(e)}")
-
-# Endpoint do sprawdzenia wszystkich użytkowników (tylko dla debugowania)
-@app.get("/debug/users")
-async def debug_users(db = Depends(get_db)):
-    try:
-        users = db.query(User).all()
-        return {
-            "users": [
-                {
-                    "id": u.id,
-                    "username": u.username,
-                    "created_at": u.created_at.isoformat()
-                } for u in users
-            ],
-            "count": len(users)
-        }
-    except Exception as e:
-        return {"error": str(e)}
 
 # HTML Interface
 @app.get("/", response_class=HTMLResponse)
