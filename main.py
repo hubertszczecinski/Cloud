@@ -546,15 +546,20 @@ async def read_root():
             
             async function apiCall(url, options = {}) {
                 try {
-                    //  Dodajemy JWT token do nagłówków
+                    const headers = {
+                        ...options.headers
+                    };
+                    
                     if (accessToken) {
-                        options.headers = {
-                            ...options.headers,
-                            'Authorization': `Bearer ${accessToken}`
-                        };
+                        headers['Authorization'] = `Bearer ${accessToken}`;
                     }
                     
-                    const response = await fetch(url, options);
+                    const requestOptions = {
+                        ...options,
+                        headers: headers
+                    };
+                    
+                    const response = await fetch(url, requestOptions);
                     if (!response.ok) {
                         const errorText = await response.text();
                         let errorJson;
@@ -568,8 +573,7 @@ async def read_root():
                     return await response.json();
                 } catch (error) {
                     console.error('API Call error:', error);
-                    //  Jeśli token wygasł, wyloguj
-                    if (error.message.includes('token') || error.message.includes('expired')) {
+                    if (error.message.includes('token') || error.message.includes('expired') || error.message.includes('Unauthorized')) {
                         logout();
                     }
                     throw error;
