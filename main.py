@@ -584,6 +584,8 @@ async def read_root():
                 const username = document.getElementById('username').value;
                 const password = document.getElementById('password').value;
                 
+                console.log('Login attempt for:', username); // ✅ Debug
+                
                 if (!username || !password) {
                     showMessage('authResult', 'Please enter username and password', 'error');
                     return;
@@ -594,16 +596,42 @@ async def read_root():
                 formData.append('password', password);
                 
                 try {
-                    const result = await apiCall('/login', { method: 'POST', body: formData });
-                    if (result.success) {
+                    const result = await apiCall('/login', { 
+                        method: 'POST', 
+                        body: formData 
+                    });
+                    
+                    console.log('Login response:', result);
+                    
+                    if (result.success && result.access_token) {
                         accessToken = result.access_token;
                         currentUser = username;
-                        document.getElementById('userName').textContent = username;
-                        document.getElementById('loginSection').classList.add('hidden');
-                        document.getElementById('appSection').classList.remove('hidden');
-                        showMessage('authResult', 'Login successful with JWT!', 'success');
+                        
+                        console.log('Setting accessToken:', accessToken);
+                        console.log('Setting currentUser:', currentUser);
+                        
+                        const userNameElement = document.getElementById('userName');
+                        const loginSection = document.getElementById('loginSection');
+                        const appSection = document.getElementById('appSection');
+                        
+                        if (userNameElement && loginSection && appSection) {
+                            userNameElement.textContent = username;
+                            loginSection.classList.add('hidden');
+                            appSection.classList.remove('hidden');
+                            showMessage('authResult', 'Login successful!', 'success');
+                            
+                            // Automatycznie pokaż listę plików
+                            showSection('filesSection');
+                            loadFiles();
+                        } else {
+                            console.error('HTML elements not found!');
+                            showMessage('authResult', 'Page error - elements missing', 'error');
+                        }
+                    } else {
+                        showMessage('authResult', 'Login failed: No token received', 'error');
                     }
                 } catch (error) {
+                    console.error('Login error:', error);
                     showMessage('authResult', 'Login failed: ' + error.message, 'error');
                 }
             }
