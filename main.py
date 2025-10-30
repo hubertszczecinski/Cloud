@@ -240,7 +240,7 @@ async def login(username: str = Form(...), password: str = Form(...), db = Depen
             logger.warning(f"Invalid credentials for user: {username}")
             raise HTTPException(status_code=401, detail="Invalid credentials")
         
-        # ✅ Tworzymy JWT token
+        # Tworzymy JWT token
         access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
         access_token = create_access_token(
             data={"sub": user.username}, expires_delta=access_token_expires
@@ -490,10 +490,10 @@ async def read_root():
             <div id="appSection" class="section hidden">
                 <div class="user-info">
                     <h2>Welcome, <span id="userName"></span>!</h2>
-                    <p><strong>Your private file space</strong> - JWT authenticated</p>
+                    <p><strong>Your private file space</strong></p>
                 </div>
                 <div class="token-info">
-                    <strong>JWT Token Active</strong> - expires in 30 minutes
+                    <strong>User Token</strong> - expires in 30 minutes
                 </div>
                 <button class="btn-logout" onclick="logout()">Logout</button>
                 
