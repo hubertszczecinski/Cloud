@@ -1,27 +1,38 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form, Response
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, Form, Response, status
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, func, inspect
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional
 import os
 import hashlib
 import secrets
 import logging
+import jwt
+from jwt.exceptions import InvalidTokenError
 
 # Konfiguracja logowania
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Automatyczne wykrywanie środowiska - działa lokalnie i na Azure
+# Konfiguracja JWT
+SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+if not SECRET_KEY:
+    raise ValueError("JWT_SECRET_KEY environment variable is required!")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+# Security
+security = HTTPBearer()
+
+# Database
 def get_base_dir():
-    # Sprawdzamy czy jesteśmy na Azure (istnieje katalog /home/site)
     if os.path.exists('/home/site'):
         return '/home/site/wwwroot'
     else:
-        # Lokalnie używamy bieżącego katalogu
         return os.getcwd()
 
 BASE_DIR = get_base_dir()
@@ -40,7 +51,7 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, index=True)
     password_hash = Column(String)
-    api_key = Column(String, unique=True, index=True)
+    api_key = Column(String, unique=True, index=True)  # Zachowujemy dla kompatybilności
     permissions = Column(String, default="read,write")
     created_at = Column(DateTime, default=func.now())
 
@@ -64,10 +75,9 @@ class LogEntry(Base):
     details = Column(Text, nullable=True)
     timestamp = Column(DateTime, default=func.now())
 
-# SPRAWDŹ CZY TABELE ISTNIEJĄ I TYLKO UTWÓRZ BRAKUJĄCE
+# Setup database
 def setup_database():
     try:
-        # Tworzymy tylko katalog uploads, nie całej ścieżki BASE_DIR
         uploads_dir = os.path.join(BASE_DIR, 'uploads')
         os.makedirs(uploads_dir, exist_ok=True)
         logger.info(f"Created uploads directory: {uploads_dir}")
@@ -89,7 +99,6 @@ def setup_database():
         logger.error(f"Database setup error: {str(e)}")
         raise
 
-# Wywołaj setup przy starcie
 setup_database()
 
 app = FastAPI(title="File Exchange System")
@@ -102,20 +111,60 @@ def get_db():
     finally:
         db.close()
 
-def get_current_user(api_key: str, db):
-    if not api_key:
-        raise HTTPException(status_code=401, detail="API key required")
-    user = db.query(User).filter(User.api_key == api_key).first()
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    return user
-
-# Helper functions
+# Helper functions dla JWT
 def hash_password(password: str) -> str:
     return hashlib.sha256(password.encode()).hexdigest()
 
 def generate_api_key() -> str:
     return secrets.token_urlsafe(32)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def verify_token(token: str):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        return payload
+    except InvalidTokenError:
+        return None
+
+# Nowa dependency dla JWT
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db = Depends(get_db)
+):
+    token = credentials.credentials
+    payload = verify_token(token)
+    if not payload:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    username: str = payload.get("sub")
+    if username is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    user = db.query(User).filter(User.username == username).first()
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return user
 
 def log_action(db, username: str, action: str, filename: Optional[str] = None, details: Optional[str] = None):
     log_entry = LogEntry(
@@ -128,7 +177,6 @@ def log_action(db, username: str, action: str, filename: Optional[str] = None, d
     db.commit()
 
 def save_file_locally(filename: str, content: bytes, username: str) -> str:
-    # Używamy os.path.join dla cross-platform compatibility
     user_folder = os.path.join(BASE_DIR, 'uploads', username)
     os.makedirs(user_folder, exist_ok=True)
     file_path = os.path.join(user_folder, filename)
@@ -136,7 +184,7 @@ def save_file_locally(filename: str, content: bytes, username: str) -> str:
         f.write(content)
     return file_path
 
-# Auth endpoints
+# Auth endpoints z JWT
 @app.post("/register")
 async def register(username: str = Form(...), password: str = Form(...), db = Depends(get_db)):
     try:
@@ -169,7 +217,6 @@ async def register(username: str = Form(...), password: str = Form(...), db = De
         
         return {
             "message": "User registered successfully", 
-            "api_key": api_key, 
             "success": True
         }
     
@@ -189,21 +236,23 @@ async def login(username: str = Form(...), password: str = Form(...), db = Depen
             raise HTTPException(status_code=400, detail="Username and password are required")
         
         user = db.query(User).filter(User.username == username).first()
-        if not user:
-            logger.warning(f"User not found: {username}")
+        if not user or user.password_hash != hash_password(password):
+            logger.warning(f"Invalid credentials for user: {username}")
             raise HTTPException(status_code=401, detail="Invalid credentials")
         
-        expected_hash = hash_password(password)
-        if user.password_hash != expected_hash:
-            logger.warning(f"Invalid password for user: {username}")
-            raise HTTPException(status_code=401, detail="Invalid credentials")
+        # ✅ Tworzymy JWT token
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={"sub": user.username}, expires_delta=access_token_expires
+        )
         
-        log_action(db, username, "login", details="User logged in")
+        log_action(db, username, "login", details="User logged in with JWT")
         logger.info(f"User {username} logged in successfully")
         
         return {
             "message": "Login successful", 
-            "api_key": user.api_key, 
+            "access_token": access_token,
+            "token_type": "bearer",
             "success": True
         }
     
@@ -214,15 +263,10 @@ async def login(username: str = Form(...), password: str = Form(...), db = Depen
         raise HTTPException(status_code=500, detail=f"Login failed: {str(e)}")
 
 @app.post("/logout")
-async def logout(api_key: str = Form(None), db = Depends(get_db)):
+async def logout(current_user: User = Depends(get_current_user), db = Depends(get_db)):
     try:
-        if not api_key:
-            return {"message": "Already logged out", "success": True}
-        
-        user = db.query(User).filter(User.api_key == api_key).first()
-        if user:
-            log_action(db, user.username, "logout", details="User logged out")
-            logger.info(f"User {user.username} logged out")
+        log_action(db, current_user.username, "logout", details="User logged out")
+        logger.info(f"User {current_user.username} logged out")
         
         return {"message": "Successfully logged out", "success": True}
     
@@ -230,20 +274,23 @@ async def logout(api_key: str = Form(None), db = Depends(get_db)):
         logger.error(f"Logout error: {str(e)}")
         return {"message": "Logout completed", "success": True}
 
-# File operations
+# File operations z JWT
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...), api_key: str = Form(...), db = Depends(get_db)):
+async def upload_file(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user),
+    db = Depends(get_db)
+):
     try:
-        user = get_current_user(api_key, db)
         contents = await file.read()
         
         existing = db.query(FileMetadata).filter(
             FileMetadata.filename == file.filename,
-            FileMetadata.owner_username == user.username
+            FileMetadata.owner_username == current_user.username
         ).first()
         
         version = existing.version + 1 if existing else 1
-        file_path = save_file_locally(file.filename, contents, user.username)
+        file_path = save_file_locally(file.filename, contents, current_user.username)
         
         if existing:
             existing.version = version
@@ -255,14 +302,14 @@ async def upload_file(file: UploadFile = File(...), api_key: str = Form(...), db
                 filename=file.filename, 
                 size=len(contents), 
                 version=version,
-                uploaded_by=user.username,
-                owner_username=user.username,
+                uploaded_by=current_user.username,
+                owner_username=current_user.username,
                 file_path=file_path
             )
             db.add(metadata)
         
         db.commit()
-        log_action(db, user.username, "upload", file.filename, f"Version {version}")
+        log_action(db, current_user.username, "upload", file.filename, f"Version {version}")
         
         return {
             "message": f"File {file.filename} uploaded successfully",
@@ -277,18 +324,21 @@ async def upload_file(file: UploadFile = File(...), api_key: str = Form(...), db
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 @app.post("/upload-multiple")
-async def upload_multiple(files: List[UploadFile] = File(...), api_key: str = Form(...), db = Depends(get_db)):
+async def upload_multiple(
+    files: List[UploadFile] = File(...),
+    current_user: User = Depends(get_current_user),
+    db = Depends(get_db)
+):
     try:
-        user = get_current_user(api_key, db)
         results = []
         
         for file in files:
             contents = await file.read()
-            file_path = save_file_locally(file.filename, contents, user.username)
+            file_path = save_file_locally(file.filename, contents, current_user.username)
             
             existing = db.query(FileMetadata).filter(
                 FileMetadata.filename == file.filename,
-                FileMetadata.owner_username == user.username
+                FileMetadata.owner_username == current_user.username
             ).first()
             
             version = existing.version + 1 if existing else 1
@@ -303,8 +353,8 @@ async def upload_multiple(files: List[UploadFile] = File(...), api_key: str = Fo
                     filename=file.filename, 
                     size=len(contents), 
                     version=version,
-                    uploaded_by=user.username,
-                    owner_username=user.username,
+                    uploaded_by=current_user.username,
+                    owner_username=current_user.username,
                     file_path=file_path
                 )
                 db.add(metadata)
@@ -312,7 +362,7 @@ async def upload_multiple(files: List[UploadFile] = File(...), api_key: str = Fo
             results.append(f"Uploaded {file.filename} (v{version})")
         
         db.commit()
-        log_action(db, user.username, "upload_multiple", details=f"Uploaded {len(files)} files")
+        log_action(db, current_user.username, "upload_multiple", details=f"Uploaded {len(files)} files")
         
         return {"message": f"Uploaded {len(files)} files", "details": results, "success": True}
     
@@ -322,15 +372,13 @@ async def upload_multiple(files: List[UploadFile] = File(...), api_key: str = Fo
         raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
 
 @app.get("/files")
-async def list_files(api_key: str, db = Depends(get_db)):
+async def list_files(current_user: User = Depends(get_current_user), db = Depends(get_db)):
     try:
-        user = get_current_user(api_key, db)
-        
         files = db.query(FileMetadata).filter(
-            FileMetadata.owner_username == user.username
+            FileMetadata.owner_username == current_user.username
         ).all()
         
-        log_action(db, user.username, "list_files")
+        log_action(db, current_user.username, "list_files")
         return {
             "files": [
                 {
@@ -349,13 +397,11 @@ async def list_files(api_key: str, db = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"Failed to list files: {str(e)}")
 
 @app.get("/download/{filename}")
-async def download_file(filename: str, api_key: str, db = Depends(get_db)):
+async def download_file(filename: str, current_user: User = Depends(get_current_user), db = Depends(get_db)):
     try:
-        user = get_current_user(api_key, db)
-        
         file_meta = db.query(FileMetadata).filter(
             FileMetadata.filename == filename,
-            FileMetadata.owner_username == user.username
+            FileMetadata.owner_username == current_user.username
         ).first()
         
         if not file_meta:
@@ -364,7 +410,7 @@ async def download_file(filename: str, api_key: str, db = Depends(get_db)):
         if not os.path.exists(file_meta.file_path):
             raise HTTPException(status_code=404, detail="File not found on server")
         
-        log_action(db, user.username, "download", filename)
+        log_action(db, current_user.username, "download", filename)
         
         return FileResponse(
             path=file_meta.file_path,
@@ -379,12 +425,10 @@ async def download_file(filename: str, api_key: str, db = Depends(get_db)):
         raise HTTPException(status_code=500, detail=f"Download failed: {str(e)}")
 
 @app.get("/logs")
-async def get_logs(api_key: str, db = Depends(get_db)):
+async def get_logs(current_user: User = Depends(get_current_user), db = Depends(get_db)):
     try:
-        user = get_current_user(api_key, db)
-        
         logs = db.query(LogEntry).filter(
-            LogEntry.username == user.username
+            LogEntry.username == current_user.username
         ).order_by(LogEntry.timestamp.desc()).limit(100).all()
         
         return {
@@ -402,7 +446,7 @@ async def get_logs(api_key: str, db = Depends(get_db)):
         logger.error(f"Get logs error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to get logs: {str(e)}")
 
-# HTML Interface
+# HTML Interface z obsługą JWT
 @app.get("/", response_class=HTMLResponse)
 async def read_root():
     return """
@@ -426,11 +470,12 @@ async def read_root():
             .error { color: red; padding: 10px; background: #f8d7da; border: 1px solid #f5c6cb; border-radius: 4px; }
             .file-item { border: 1px solid #ddd; padding: 10px; margin: 5px 0; border-radius: 4px; }
             .user-info { background: #e9ecef; padding: 10px; border-radius: 5px; margin-bottom: 20px; }
+            .token-info { background: #d1ecf1; padding: 10px; border-radius: 5px; margin: 10px 0; font-size: 12px; word-break: break-all; }
         </style>
     </head>
     <body>
         <div class="container">
-            <h1>📁 File Exchange System</h1>
+            <h1>📁 File Exchange System (JWT)</h1>
             
             <div id="loginSection" class="section">
                 <h2>Login / Register</h2>
@@ -445,7 +490,10 @@ async def read_root():
             <div id="appSection" class="section hidden">
                 <div class="user-info">
                     <h2>Welcome, <span id="userName"></span>!</h2>
-                    <p><strong>Your private file space</strong> - only you can see and access your files</p>
+                    <p><strong>Your private file space</strong> - JWT authenticated</p>
+                </div>
+                <div class="token-info">
+                    <strong>JWT Token Active</strong> - expires in 30 minutes
                 </div>
                 <button class="btn-logout" onclick="logout()">Logout</button>
                 
@@ -484,7 +532,7 @@ async def read_root():
         </div>
         
         <script>
-            let apiKey = '';
+            let accessToken = '';
             let currentUser = '';
             
             function showSection(sectionId) {
@@ -498,6 +546,14 @@ async def read_root():
             
             async function apiCall(url, options = {}) {
                 try {
+                    //  Dodajemy JWT token do nagłówków
+                    if (accessToken) {
+                        options.headers = {
+                            ...options.headers,
+                            'Authorization': `Bearer ${accessToken}`
+                        };
+                    }
+                    
                     const response = await fetch(url, options);
                     if (!response.ok) {
                         const errorText = await response.text();
@@ -512,6 +568,10 @@ async def read_root():
                     return await response.json();
                 } catch (error) {
                     console.error('API Call error:', error);
+                    //  Jeśli token wygasł, wyloguj
+                    if (error.message.includes('token') || error.message.includes('expired')) {
+                        logout();
+                    }
                     throw error;
                 }
             }
@@ -532,12 +592,12 @@ async def read_root():
                 try {
                     const result = await apiCall('/login', { method: 'POST', body: formData });
                     if (result.success) {
-                        apiKey = result.api_key;
+                        accessToken = result.access_token;
                         currentUser = username;
                         document.getElementById('userName').textContent = username;
                         document.getElementById('loginSection').classList.add('hidden');
                         document.getElementById('appSection').classList.remove('hidden');
-                        showMessage('authResult', 'Login successful!', 'success');
+                        showMessage('authResult', 'Login successful with JWT!', 'success');
                     }
                 } catch (error) {
                     showMessage('authResult', 'Login failed: ' + error.message, 'error');
@@ -570,12 +630,9 @@ async def read_root():
                 try {
                     const result = await apiCall('/register', { method: 'POST', body: formData });
                     if (result.success) {
-                        apiKey = result.api_key;
-                        currentUser = username;
-                        document.getElementById('userName').textContent = username;
-                        document.getElementById('loginSection').classList.add('hidden');
-                        document.getElementById('appSection').classList.remove('hidden');
-                        showMessage('authResult', 'Registration successful!', 'success');
+                        showMessage('authResult', 'Registration successful! Please login.', 'success');
+                        document.getElementById('username').value = '';
+                        document.getElementById('password').value = '';
                     }
                 } catch (error) {
                     showMessage('authResult', 'Registration failed: ' + error.message, 'error');
@@ -583,17 +640,12 @@ async def read_root():
             }
             
             async function logout() {
-                const formData = new FormData();
-                if (apiKey) {
-                    formData.append('api_key', apiKey);
-                }
-                
                 try {
-                    await apiCall('/logout', { method: 'POST', body: formData });
+                    await apiCall('/logout', { method: 'POST' });
                 } catch (error) {
                     // Ignore logout errors
                 } finally {
-                    apiKey = '';
+                    accessToken = '';
                     currentUser = '';
                     document.getElementById('appSection').classList.add('hidden');
                     document.getElementById('loginSection').classList.remove('hidden');
@@ -618,7 +670,6 @@ async def read_root():
                 
                 const formData = new FormData();
                 formData.append('file', fileInput.files[0]);
-                formData.append('api_key', apiKey);
                 
                 try {
                     const result = await apiCall('/upload', { method: 'POST', body: formData });
@@ -639,7 +690,6 @@ async def read_root():
                 }
                 
                 const formData = new FormData();
-                formData.append('api_key', apiKey);
                 for (let file of fileInput.files) {
                     formData.append('files', file);
                 }
@@ -658,12 +708,12 @@ async def read_root():
             }
             
             function downloadFile(filename) {
-                window.open(`/download/${filename}?api_key=${apiKey}`, '_blank');
+                window.open(`/download/${filename}`, '_blank');
             }
             
             async function loadFiles() {
                 try {
-                    const result = await apiCall(`/files?api_key=${apiKey}`);
+                    const result = await apiCall('/files');
                     if (result.success) {
                         const filesList = document.getElementById('filesList');
                         filesList.innerHTML = '<h4>My Files:</h4>';
@@ -692,7 +742,7 @@ async def read_root():
             
             async function loadLogs() {
                 try {
-                    const result = await apiCall(`/logs?api_key=${apiKey}`);
+                    const result = await apiCall('/logs');
                     if (result.success) {
                         const logsList = document.getElementById('logsList');
                         logsList.innerHTML = '<h4>My Activity Logs:</h4>';
